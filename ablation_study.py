@@ -376,6 +376,7 @@ def run_ablation_study(
     # First run with base parameters
     print("Running benchmark with base parameters...")
     base_result = run_benchmark(base_params, run_dir, 0)
+    base_result['ablation'] = 'base'
     save_single_result(base_result, results_file)
     results.append(base_result)
 
@@ -391,6 +392,7 @@ def run_ablation_study(
             print(f"Running benchmark with {param_name} = {value}...")
             modified_params = base_params.create_variation(param_name, value)
             result = run_benchmark(modified_params, run_dir, run_id)
+            result['ablation'] = param_name
             run_ids_of_each_param[param_name].append(run_id)
             save_single_result(result, results_file)
             run_id += 1
