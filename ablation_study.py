@@ -28,19 +28,21 @@ class BenchmarkParams:
 
     # Benchmark configuration
     warmup: int = 0
-    num_requests: int = 10000
+    num_requests: int = 4
     concurrency: int = 3072
     max_batch_size: int = 384
     max_num_tokens: int = 1536
     kv_cache_free_gpu_mem_fraction: float = 0.85
 
-    # PyTorch backend configuration
+    # pytorch_backend_config
     use_cuda_graph: bool = True
     cuda_graph_padding_enabled: bool = True
     cuda_graph_batch_sizes: List[int] = field(
         default_factory=lambda: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384])
     print_iter_log: bool = True
     enable_overlap_scheduler: bool = True
+
+    # extra configs outside the "pytorch_backend_config" field
     enable_attention_dp: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -77,23 +79,71 @@ def create_config_file(params: BenchmarkParams) -> None:
         yaml.dump(config, f, default_flow_style=False)
 
 
+def extract_metrics_from_output(output: str) -> Dict[str, float]:
+    """
+    Extract all performance metrics from the benchmark output.
+
+    Args:
+        output: Raw text output from the benchmark run
+
+    Returns:
+        Dictionary mapping metric names to their values
+    """
+    metrics = {}
+
+    # Define all the metrics to extract with their regex patterns
+    metric_patterns = {
+        'request_throughput': r'Request Throughput \(req/sec\):\s+([\d.]+)',
+        'total_output_throughput':
+        r'Total Output Throughput \(tokens/sec\):\s+([\d.]+)',
+        'per_user_throughput':
+        r'Per User Output Throughput \(tokens/sec/user\):\s+([\d.]+)',
+        'per_gpu_throughput':
+        r'Per GPU Output Throughput \(tokens/sec/gpu\):\s+([\d.]+)',
+        'total_token_throughput':
+        r'Total Token Throughput \(tokens/sec\):\s+([\d.]+)',
+        'total_latency': r'Total Latency \(ms\):\s+([\d.]+)',
+        'avg_request_latency': r'Average request latency \(ms\):\s+([\d.]+)',
+        'latency_p50': r'\[Latency\] P50\s+: ([\d.]+)',
+        'latency_p90': r'\[Latency\] P90\s+: ([\d.]+)',
+        'latency_p95': r'\[Latency\] P95\s+: ([\d.]+)',
+        'latency_p99': r'\[Latency\] P99\s+: ([\d.]+)',
+        'latency_min': r'\[Latency\] MINIMUM: ([\d.]+)',
+        'latency_max': r'\[Latency\] MAXIMUM: ([\d.]+)',
+        'latency_avg': r'\[Latency\] AVERAGE: ([\d.]+)'
+    }
+
+    # Extract each metric using its regex pattern
+    for metric_name, pattern in metric_patterns.items():
+        match = re.search(pattern, output)
+        if match:
+            metrics[metric_name] = float(match.group(1))
+
+    return metrics
+
+
 def run_benchmark(params: BenchmarkParams) -> Dict[str, Any]:
     """Run the benchmark with the given parameters and return results."""
     create_config_file(params)
 
+    # yapf: disable
     cmd = [
-        'trtllm-bench', '-m', params.model_path, 'throughput', '--tp',
-        str(params.tp), '--ep',
-        str(params.ep), '--warmup',
-        str(params.warmup), '--dataset', params.dataset_path, '--backend',
-        'pytorch', '--max_batch_size',
-        str(params.max_batch_size), '--max_num_tokens',
-        str(params.max_num_tokens), '--num_requests',
-        str(params.num_requests), '--concurrency',
-        str(params.concurrency), '--kv_cache_free_gpu_mem_fraction',
-        str(params.kv_cache_free_gpu_mem_fraction), '--extra_llm_api_options',
-        './extra-llm-api-config.yml'
+        'python3', '-m', 'tensorrt_llm.commands.bench',
+        '-m', params.model_path,
+        'throughput',
+        '--tp', str(params.tp),
+        '--ep', str(params.ep),
+        '--warmup', str(params.warmup),
+        '--dataset', params.dataset_path,
+        '--backend', 'pytorch',
+        '--max_batch_size', str(params.max_batch_size),
+        '--max_num_tokens', str(params.max_num_tokens),
+        '--num_requests', str(params.num_requests),
+        '--concurrency', str(params.concurrency),
+        '--kv_cache_free_gpu_mem_fraction', str(params.kv_cache_free_gpu_mem_fraction),
+        '--extra_llm_api_options', './extra-llm-api-config.yml'
     ]
+    # yapf: enable
 
     print(f"Running benchmark with parameters: {params}")
     start_time = time.time()
@@ -101,12 +151,32 @@ def run_benchmark(params: BenchmarkParams) -> Dict[str, Any]:
     timestamp = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
     print(f"Start time: {timestamp}")
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout
-    except subprocess.CalledProcessError as e:
-        print(f"Error running benchmark: {e}")
-        output = e.stdout
+    # Set up environment with TQDM_MININTERVAL=1000
+    env = os.environ.copy()
+    env['TQDM_MININTERVAL'] = '1000'
+
+    # Use Popen to be able to stream output in real-time
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Redirect stderr to stdout
+        text=True,
+        bufsize=1,  # Line buffered
+        universal_newlines=True,
+        env=env  # Use the modified environment
+    )
+
+    # Collect output for later analysis
+    output_lines = []
+
+    # Stream and capture output
+    for line in process.stdout:
+        print(line.rstrip())  # Print line in real-time (strip trailing newline)
+        output_lines.append(line)  # Store for later analysis
+
+    # Wait for process to complete and check return code
+    return_code = process.wait()
+    output = ''.join(output_lines)
 
     end_time = time.time()
     elapsed = end_time - start_time
@@ -115,24 +185,26 @@ def run_benchmark(params: BenchmarkParams) -> Dict[str, Any]:
     print(f"End time: {timestamp}")
     print(f"Elapsed time: {elapsed:.2f} seconds")
 
-    # Extract throughput from output using regex
-    throughput_match = re.search(r'Throughput: ([\d.]+) tokens/s', output)
-    throughput = float(throughput_match.group(1)) if throughput_match else None
-    if throughput is None:
-        print("Could not find throughput in output")
+    # Handle non-zero return code
+    if return_code != 0:
+        print(f"Command failed with return code {return_code}")
+        print(f"Command was: {' '.join(cmd)}")
 
-    # Extract latency from output
-    latency_match = re.search(r'Latency p50: ([\d.]+) ms', output)
-    latency = float(latency_match.group(1)) if latency_match else None
-    if latency is None:
-        print("Could not find latency in output")
+    # Extract metrics from the output
+    metrics = extract_metrics_from_output(output)
+
+    # Check if we found any metrics
+    if not metrics:
+        print("Could not find performance metrics in output")
+    else:
+        print(f"Found {len(metrics)} performance metrics")
 
     result = {
         'params': params.to_dict(),
-        'throughput': throughput,
-        'latency': latency,
+        'metrics': metrics,
         'elapsed_time': elapsed,
-        'raw_output': output
+        'raw_output': output,
+        'return_code': return_code
     }
 
     return result
@@ -189,12 +261,13 @@ def save_results(results: List[Dict[str, Any]], filename: str) -> pd.DataFrame:
     """Save results to a CSV file."""
     rows = []
     for i, result in enumerate(results):
-        row = {
-            'run_id': i,
-            'throughput': result['throughput'],
-            'latency': result['latency'],
-            'elapsed_time': result['elapsed_time']
-        }
+        # Start with run ID and elapsed time
+        row = {'run_id': i, 'elapsed_time': result['elapsed_time']}
+
+        # Add all metrics
+        for metric_name, metric_value in result['metrics'].items():
+            row[metric_name] = metric_value
+
         # Add all parameters
         for key, value in result['params'].items():
             if isinstance(value, list):
@@ -218,8 +291,17 @@ def save_results(results: List[Dict[str, Any]], filename: str) -> pd.DataFrame:
 
 def plot_results(df: pd.DataFrame,
                  x_param: str,
+                 y_param: str = 'total_output_throughput',
                  output_file: Optional[str] = None) -> None:
-    """Create a plot showing the effect of a parameter on throughput."""
+    """
+    Create a plot showing the effect of a parameter on a performance metric.
+
+    Args:
+        df: DataFrame with results
+        x_param: Parameter to plot on x-axis
+        y_param: Metric to plot on y-axis (default: total_output_throughput)
+        output_file: Optional file to save plot to
+    """
     plt.figure(figsize=(12, 6))
 
     if isinstance(df[x_param].iloc[0], list) or df[x_param].dtype == 'object':
@@ -227,14 +309,15 @@ def plot_results(df: pd.DataFrame,
         # We need a simpler representation for the x-axis
         df['param_repr'] = df[x_param].apply(lambda x: str(x)[:10] + '...'
                                              if len(str(x)) > 10 else str(x))
-        sns.barplot(x='param_repr', y='throughput', data=df)
+        sns.barplot(x='param_repr', y=y_param, data=df)
         plt.xticks(rotation=45)
     else:
         # For numeric parameters
-        sns.lineplot(x=x_param, y='throughput', data=df, marker='o')
+        sns.lineplot(x=x_param, y=y_param, data=df, marker='o')
 
-    plt.title(f'Effect of {x_param} on Throughput')
-    plt.ylabel('Throughput (tokens/s)')
+    metric_name = y_param.replace('_', ' ').title()
+    plt.title(f'Effect of {x_param} on {metric_name}')
+    plt.ylabel(metric_name)
     plt.tight_layout()
 
     if output_file:
@@ -243,19 +326,29 @@ def plot_results(df: pd.DataFrame,
         plt.show()
 
 
+def run_baseline(base_params: BenchmarkParams) -> List[Dict[str, Any]]:
+    """Run a single benchmark with the base parameters."""
+    print("Running benchmark with base parameters...")
+    result = run_benchmark(base_params)
+    return [result]  # Return as a list for consistency with other modes
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Run ablation study on TRT-LLM benchmarking parameters')
     parser.add_argument(
         '--mode',
-        choices=['ablation', 'grid'],
-        default='ablation',
+        choices=['baseline', 'ablation', 'grid'],
+        default='baseline',
         help=
-        'Study mode: ablation (change one parameter at a time) or grid (try all combinations)'
-    )
+        'Study mode: baseline (single run), ablation (change one parameter at a time), '
+        'or grid (try all combinations)')
     parser.add_argument('--output',
                         default='ablation_results.csv',
                         help='Output file for results')
+    parser.add_argument('--no-plots',
+                        action='store_true',
+                        help='Skip generating plots')
     args = parser.parse_args()
 
     # Create base parameters using the dataclass
@@ -296,24 +389,44 @@ def main():
         with open('dataset.txt', 'w') as f:
             subprocess.run(prepare_cmd, stdout=f, check=True)
 
-    # Run the study
-    if args.mode == 'ablation':
+    # Run the study based on the selected mode
+    if args.mode == 'baseline':
+        results = run_baseline(base_params)
+    elif args.mode == 'ablation':
         results = run_ablation_study(base_params, param_variations)
     else:  # grid search
         results = run_grid_search(base_params, param_grid)
 
-    # Save and visualize results
+    # Save results
     df = save_results(results, args.output)
+
+    # Skip plotting for baseline mode or if no-plots is specified
+    if args.mode == 'baseline' or args.no_plots:
+        print("Skipping plots generation")
+        return
 
     # Create plots for each parameter
     os.makedirs('plots', exist_ok=True)
+
+    # Key metrics to plot
+    key_metrics = [
+        'total_output_throughput', 'total_token_throughput', 'latency_p50',
+        'latency_p99'
+    ]
+
     for param in param_variations.keys():
         param_results = [r for r in results if param in r['params']]
         if len(param_results
                ) > 1:  # Only plot if we have multiple values for this param
             plot_df = df[~df[param].isna()]
             if len(plot_df) > 1:
-                plot_results(plot_df, param, f'plots/{param}_vs_throughput.png')
+                for metric in key_metrics:
+                    if metric in df.columns:
+                        plot_results(
+                            plot_df,
+                            x_param=param,
+                            y_param=metric,
+                            output_file=f'plots/{param}_vs_{metric}.png')
 
 
 if __name__ == '__main__':
