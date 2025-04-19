@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import itertools
 import os
 import re
@@ -342,7 +343,6 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
         'params': params.to_dict(),
         'metrics': metrics,
         'elapsed_time': elapsed,
-        'raw_output': output,
         'return_code': return_code,
         'output_file': output_file,
         'config_file': config_path,
@@ -429,7 +429,9 @@ def run_grid_search(base_params: BenchmarkParams, param_grid: Dict[str,
 def save_single_result(result: Dict[str, Any], results_file: str) -> None:
     """Save a single benchmark result to CSV file, creating or appending as needed."""
     # Create row from the result
-    row = {'run_id': result['run_id'], 'elapsed_time': result['elapsed_time']}
+    row = copy.deepcopy(result)
+    del row['metrics']
+    del row['params']
 
     # Add all metrics
     for metric_name, metric_value in result['metrics'].items():
@@ -441,9 +443,6 @@ def save_single_result(result: Dict[str, Any], results_file: str) -> None:
             row[key] = str(value)
         else:
             row[key] = value
-
-    # Add timeout status
-    row['timed_out'] = result.get('timed_out', False)
 
     # Create DataFrame with single row
     df = pd.DataFrame([row])
