@@ -14,6 +14,21 @@ import pandas as pd
 import seaborn as sns
 import yaml
 
+# Define all possible parameter variations for studies
+ALL_PARAM_VARIATIONS = {
+    'tp': [1, 2, 4, 8],
+    'ep': [1, 2, 4, 8],
+    'max_batch_size': [64, 128, 256, 384, 512],
+    'max_num_tokens': [512, 1024, 1536, 2048],
+    'concurrency': [512, 1024, 2048, 3072, 4096],
+    'kv_cache_free_gpu_mem_fraction': [0.7, 0.8, 0.85, 0.9],
+    'use_cuda_graph': [True, False],
+    'cuda_graph_padding_enabled': [True, False],
+    'enable_overlap_scheduler': [True, False],
+    'enable_attention_dp': [True, False],
+    'num_requests': [2, 4, 8, 16, 32, 64]
+}
+
 
 @dataclass
 class BenchmarkParams:
@@ -21,6 +36,15 @@ class BenchmarkParams:
     # Model parameters
     model_path: str = "/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-FP4"
     dataset_path: str = "./dataset.txt"
+
+    # Dataset parameters
+    dataset_tokenizer: str = "nvidia/DeepSeek-R1-FP4"
+    dataset_type: str = "token-norm-dist"
+    dataset_input_mean: int = 1024
+    dataset_output_mean: int = 2048
+    dataset_input_stdev: int = 0
+    dataset_output_stdev: int = 0
+    dataset_num_requests: int = 49152
 
     # Parallelism parameters
     tp: int = 8  # Tensor Parallelism
@@ -160,6 +184,29 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
         # Add environment variables
         f.write("# Set environment variables\n")
         f.write("export TQDM_MININTERVAL=1000\n\n")
+
+        # Add dataset generation command to repro script
+        f.write("# Generate dataset\n")
+        dataset_filename = "./dataset.txt"
+        dataset_cmd = [
+            'python',
+            'benchmarks/cpp/prepare_dataset.py',
+            '--stdout',
+            '--tokenizer',
+            params.dataset_tokenizer,
+            params.dataset_type,
+            '--input-mean',
+            str(params.dataset_input_mean),
+            '--output-mean',
+            str(params.dataset_output_mean),
+            '--input-stdev',
+            str(params.dataset_input_stdev),
+            '--output-stdev',
+            str(params.dataset_output_stdev),
+            '--num-requests',
+            str(params.dataset_num_requests),
+        ]
+        f.write(f"{' '.join(dataset_cmd)} > {dataset_filename}\n\n")
 
         # Include the config file content
         with open(config_path, 'r') as config_file:
@@ -361,11 +408,32 @@ def plot_results(df: pd.DataFrame,
         # We need a simpler representation for the x-axis
         df['param_repr'] = df[x_param].apply(lambda x: str(x)[:10] + '...'
                                              if len(str(x)) > 10 else str(x))
-        sns.barplot(x='param_repr', y=y_param, data=df)
+        # Create the bar plot
+        ax = sns.barplot(x='param_repr', y=y_param, data=df)
+
+        # Add value annotations to each bar
+        for i, p in enumerate(ax.patches):
+            value = p.get_height()
+            ax.annotate(f'{value:.1f}', (p.get_x() + p.get_width() / 2., value),
+                        ha='center',
+                        va='bottom',
+                        fontsize=9)
+
         plt.xticks(rotation=45)
     else:
         # For numeric parameters
-        sns.lineplot(x=x_param, y=y_param, data=df, marker='o')
+        ax = sns.lineplot(x=x_param, y=y_param, data=df, marker='o')
+
+        # Add value annotations to each point
+        for x, y in zip(df[x_param], df[y_param]):
+            ax.annotate(
+                f'{y:.1f}',
+                (x, y),
+                xytext=(0, 10),  # 10 points vertical offset
+                textcoords='offset points',
+                ha='center',
+                va='bottom',
+                fontsize=9)
 
     metric_name = y_param.replace('_', ' ').title()
     plt.title(f'Effect of {x_param} on {metric_name}')
@@ -376,6 +444,24 @@ def plot_results(df: pd.DataFrame,
         plt.savefig(output_file)
     else:
         plt.show()
+
+
+def validate_study_params(parser, study_params_str):
+    """Validate study parameters against available choices."""
+    params = study_params_str.split(',')
+    valid_params = list(ALL_PARAM_VARIATIONS.keys()) + ['all']
+
+    invalid_params = [
+        param.strip() for param in params
+        if param.strip() != 'all' and param.strip() not in ALL_PARAM_VARIATIONS
+    ]
+
+    if invalid_params:
+        parser.error(
+            f"Invalid parameter(s) in --study-params: {', '.join(invalid_params)}. "
+            f"Valid choices are: {', '.join(valid_params)}")
+
+    return study_params_str
 
 
 def main():
@@ -394,7 +480,40 @@ def main():
     parser.add_argument('--no-plots',
                         action='store_true',
                         help='Skip generating plots')
+
+    # Ablation study parameters
+    parser.add_argument(
+        '--study-params',
+        default='use_cuda_graph',
+        help='Comma-separated list of parameters to study in ablation mode. '
+        'Valid choices: ' + ', '.join(ALL_PARAM_VARIATIONS.keys()) +
+        ', all. Default: use_cuda_graph')
+
+    # Dataset generation parameters
+    parser.add_argument('--dataset-type', help='Dataset type')
+    parser.add_argument('--dataset-input-mean',
+                        type=int,
+                        help='Mean input length for dataset generation')
+    parser.add_argument('--dataset-output-mean',
+                        type=int,
+                        help='Mean output length for dataset generation')
+    parser.add_argument(
+        '--dataset-input-stdev',
+        type=int,
+        help='Standard deviation of input length for dataset generation')
+    parser.add_argument(
+        '--dataset-output-stdev',
+        type=int,
+        help='Standard deviation of output length for dataset generation')
+    parser.add_argument('--dataset-num-requests',
+                        type=int,
+                        help='Number of requests in the dataset')
+
     args = parser.parse_args()
+
+    # Validate study parameters if in ablation mode
+    if args.mode == 'ablation':
+        validate_study_params(parser, args.study_params)
 
     # Create timestamped run directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -418,19 +537,50 @@ def main():
     base_params = BenchmarkParams()
     base_params.dataset_path = dataset_path  # Use dataset in run directory
 
-    # Define parameter variations for ablation study
-    param_variations = {
-        'tp': [1, 2, 4, 8],
-        'ep': [1, 2, 4, 8],
-        'max_batch_size': [64, 128, 256, 384, 512],
-        'max_num_tokens': [512, 1024, 1536, 2048],
-        'concurrency': [512, 1024, 2048, 3072, 4096],
-        'kv_cache_free_gpu_mem_fraction': [0.7, 0.8, 0.85, 0.9],
-        'use_cuda_graph': [True, False],
-        'cuda_graph_padding_enabled': [True, False],
-        'enable_overlap_scheduler': [True, False],
-        'enable_attention_dp': [True, False]
-    }
+    # Update dataset parameters from command line args if provided
+    if args.dataset_type is not None:
+        base_params.dataset_type = args.dataset_type
+    if args.dataset_input_mean is not None:
+        base_params.dataset_input_mean = args.dataset_input_mean
+    if args.dataset_output_mean is not None:
+        base_params.dataset_output_mean = args.dataset_output_mean
+    if args.dataset_input_stdev is not None:
+        base_params.dataset_input_stdev = args.dataset_input_stdev
+    if args.dataset_output_stdev is not None:
+        base_params.dataset_output_stdev = args.dataset_output_stdev
+    if args.dataset_num_requests is not None:
+        base_params.dataset_num_requests = args.dataset_num_requests
+
+    # Use only the specified parameters for the ablation study
+    if args.mode == 'ablation':
+        study_params = args.study_params.split(',')
+        param_variations = {}
+
+        # Special case for 'all'
+        if 'all' in study_params:
+            print("Studying all parameters as requested")
+            param_variations = ALL_PARAM_VARIATIONS
+        else:
+            # Process individual parameters
+            for param in study_params:
+                param = param.strip()
+                if param in ALL_PARAM_VARIATIONS:
+                    param_variations[param] = ALL_PARAM_VARIATIONS[param]
+                else:
+                    print(
+                        f"Warning: Unknown parameter '{param}'. Valid parameters: "
+                        f"{', '.join(ALL_PARAM_VARIATIONS.keys())}")
+
+            if not param_variations:
+                print(
+                    "No valid parameters specified for ablation study. Using default (use_cuda_graph)."
+                )
+                if 'use_cuda_graph' in ALL_PARAM_VARIATIONS:
+                    param_variations['use_cuda_graph'] = ALL_PARAM_VARIATIONS[
+                        'use_cuda_graph']
+    else:
+        # For other modes, use all parameter variations
+        param_variations = ALL_PARAM_VARIATIONS
 
     # For grid search, we use a smaller set of parameters to avoid combinatorial explosion
     param_grid = {
@@ -445,9 +595,13 @@ def main():
         print(f"Dataset not found. Creating dataset at {dataset_path}...")
         prepare_cmd = [
             'python', 'benchmarks/cpp/prepare_dataset.py', '--stdout',
-            '--tokenizer', 'nvidia/DeepSeek-R1-FP4', 'token-norm-dist',
-            '--input-mean', '1024', '--output-mean', '2048', '--input-stdev',
-            '0', '--output-stdev', '0', '--num-requests', '49152'
+            '--tokenizer', base_params.dataset_tokenizer,
+            base_params.dataset_type, '--input-mean',
+            str(base_params.dataset_input_mean), '--output-mean',
+            str(base_params.dataset_output_mean), '--input-stdev',
+            str(base_params.dataset_input_stdev), '--output-stdev',
+            str(base_params.dataset_output_stdev), '--num-requests',
+            str(base_params.dataset_num_requests)
         ]
 
         with open(dataset_path, 'w') as f:
@@ -487,10 +641,7 @@ def main():
 
     # Create plots for each parameter
     # Key metrics to plot
-    key_metrics = [
-        'total_output_throughput', 'total_token_throughput', 'latency_p50',
-        'latency_p99'
-    ]
+    key_metrics = ['per_gpu_throughput', 'per_user_throughput', 'elapsed_time']
 
     for param in param_variations.keys():
         param_results = [r for r in results if param in r['params']]
