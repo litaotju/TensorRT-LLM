@@ -26,7 +26,7 @@ ALL_PARAM_VARIATIONS = {
     'cuda_graph_padding_enabled': [True, False],
     'enable_overlap_scheduler': [True, False],
     'enable_attention_dp': [True, False],
-    'num_requests': [2, 4, 8, 16, 32, 64]
+    'num_requests': [4, 400, 4000, 10000, 16000, 32000, 64000]
 }
 
 
