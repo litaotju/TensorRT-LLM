@@ -52,7 +52,7 @@ class BenchmarkParams:
 
     # Benchmark configuration
     warmup: int = 0
-    num_requests: int = 4
+    num_requests: int = 10000
     concurrency: int = 3072
     max_batch_size: int = 384
     max_num_tokens: int = 1536
