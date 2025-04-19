@@ -16,8 +16,8 @@ import yaml
 
 # Define all possible parameter variations for studies
 ALL_PARAM_VARIATIONS = {
-    'tp': [1, 2, 4, 8],
-    'ep': [1, 2, 4, 8],
+    'tp': [4, 8],
+    'ep': [4, 8],
     'max_batch_size': [64, 128, 256, 384, 512],
     'max_num_tokens': [512, 1024, 1536, 2048],
     'concurrency': [512, 1024, 2048, 3072, 4096],
@@ -223,6 +223,8 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
         for i, arg in enumerate(cmd_copy):
             if arg == config_path:
                 cmd_copy[i] = "./config.yml"
+            if arg == params.dataset_path:
+                cmd_copy[i] = dataset_filename
         f.write(" ".join(cmd_copy) + "\n")
 
     # Make the script executable
