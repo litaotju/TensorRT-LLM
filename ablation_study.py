@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -19,7 +19,7 @@ ALL_PARAM_VARIATIONS = {
     'tp': [4, 8],
     'ep': [4, 8],
     'max_batch_size': [64, 128, 256, 384, 512],
-    'max_num_tokens': [512, 1024, 1536, 2048],
+    'max_num_tokens': [1024, 1536, 2048],
     'concurrency': [512, 1024, 2048, 3072, 4096],
     'kv_cache_free_gpu_mem_fraction': [0.7, 0.8, 0.85, 0.9],
     'use_cuda_graph': [True, False],
@@ -28,6 +28,9 @@ ALL_PARAM_VARIATIONS = {
     'enable_attention_dp': [True, False],
     'num_requests': [4, 400, 4000, 10000, 16000, 32000, 64000]
 }
+
+TIMEOUT_IN_SECONDS = 90 * 60  # 5400 seconds
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ['true', '1', 'yes', 'y']
 
 
 @dataclass
@@ -40,11 +43,11 @@ class BenchmarkParams:
     # Dataset parameters
     dataset_tokenizer: str = "nvidia/DeepSeek-R1-FP4"
     dataset_type: str = "token-norm-dist"
-    dataset_input_mean: int = 1024
-    dataset_output_mean: int = 2048
+    dataset_input_mean: int = 1024 if not DEBUG else 10
+    dataset_output_mean: int = 2048 if not DEBUG else 10
     dataset_input_stdev: int = 0
     dataset_output_stdev: int = 0
-    dataset_num_requests: int = 49152
+    dataset_num_requests: int = 49152 if not DEBUG else 4
 
     # Parallelism parameters
     tp: int = 8  # Tensor Parallelism
@@ -52,7 +55,7 @@ class BenchmarkParams:
 
     # Benchmark configuration
     warmup: int = 0
-    num_requests: int = 10000
+    num_requests: int = 10000 if not DEBUG else 4
     concurrency: int = 3072
     max_batch_size: int = 384
     max_num_tokens: int = 1536
@@ -125,6 +128,8 @@ def extract_metrics_from_output(output: str) -> Dict[str, float]:
         match = re.search(pattern, output)
         if match:
             metrics[metric_name] = float(match.group(1))
+        else:
+            metrics[metric_name] = None
 
     return metrics
 
@@ -254,12 +259,55 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
     # Collect output for later analysis
     output_lines = []
 
-    # Stream and capture output
-    for line in process.stdout:
-        print(line.rstrip())  # Print line in real-time (strip trailing newline)
-        output_lines.append(line)  # Store for later analysis
+    # Set timeout to 1.5 hours (90 minutes)
+    timeout_seconds = TIMEOUT_IN_SECONDS
+    timed_out = False
 
-    # Wait for process to complete and check return code
+    # Stream and capture output with timeout check
+    while True:
+        # Check if process has completed
+        if process.poll() is not None:
+            break
+
+        # Check for timeout
+        current_time = time.time()
+        if current_time - start_time > timeout_seconds:
+            print(
+                f"Benchmark timeout after {timeout_seconds/60:.1f} minutes. Terminating process."
+            )
+            process.terminate()
+            try:
+                # Wait a bit for graceful termination
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't terminate
+                print("Process not responding to termination. Force killing.")
+                process.kill()
+                process.wait()
+            timed_out = True
+            break
+
+        # Read output with a timeout to allow for regular timeout checks
+        try:
+            line = process.stdout.readline()
+            if not line:
+                # No more output but process is still running
+                time.sleep(1)  # Avoid busy waiting
+                continue
+
+            print(line.rstrip())  # Print line in real-time
+            output_lines.append(line)  # Store for later analysis
+
+        except Exception as e:
+            print(f"Error reading process output: {e}")
+            break
+
+    # Consume any remaining output
+    for line in process.stdout:
+        print(line.rstrip())
+        output_lines.append(line)
+
+    # Get return code
     return_code = process.wait()
     output = ''.join(output_lines)
 
@@ -271,7 +319,13 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
     print(f"Elapsed time: {elapsed:.2f} seconds")
 
     # Handle non-zero return code
-    if return_code != 0:
+    if timed_out:
+        print(f"Benchmark timed out after {timeout_seconds/60:.1f} minutes")
+        # Add timeout information to output
+        timeout_msg = f"\n\nBENCHMARK TIMED OUT AFTER {timeout_seconds/60:.1f} MINUTES\n\n"
+        output += timeout_msg
+        return_code = -999  # Special code for timeout
+    elif return_code != 0:
         print(f"Command failed with return code {return_code}")
         print(f"Command was: {' '.join(cmd)}")
 
@@ -283,12 +337,6 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
     # Extract metrics from the output
     metrics = extract_metrics_from_output(output)
 
-    # Check if we found any metrics
-    if not metrics:
-        print("Could not find performance metrics in output")
-    else:
-        print(f"Found {len(metrics)} performance metrics")
-
     result = {
         'run_id': run_id,
         'params': params.to_dict(),
@@ -298,34 +346,43 @@ def run_benchmark(params: BenchmarkParams, run_dir: str,
         'return_code': return_code,
         'output_file': output_file,
         'config_file': config_path,
-        'repro_script': repro_script_path
+        'repro_script': repro_script_path,
+        'timed_out': timed_out
     }
 
     return result
 
 
-def run_baseline(base_params: BenchmarkParams,
-                 run_dir: str) -> List[Dict[str, Any]]:
+def run_baseline(base_params: BenchmarkParams, run_dir: str,
+                 results_file: str) -> List[Dict[str, Any]]:
     """Run a single benchmark with the base parameters."""
     print("Running benchmark with base parameters...")
     result = run_benchmark(base_params, run_dir, 0)
+
+    # Save result immediately
+    save_single_result(result, results_file)
+
     return [result]  # Return as a list for consistency with other modes
 
 
-def run_ablation_study(base_params: BenchmarkParams,
-                       param_variations: Dict[str, List[Any]],
-                       run_dir: str) -> List[Dict[str, Any]]:
+def run_ablation_study(
+        base_params: BenchmarkParams, param_variations: Dict[str, List[Any]],
+        run_dir: str,
+        results_file: str) -> Tuple[List[Dict[str, Any]], Dict[str, List[int]]]:
     """Run ablation study by varying one parameter at a time."""
     results = []
+    run_ids_of_each_param = {}
 
     # First run with base parameters
     print("Running benchmark with base parameters...")
     base_result = run_benchmark(base_params, run_dir, 0)
+    save_single_result(base_result, results_file)
     results.append(base_result)
 
     # For each parameter, run with different values
     run_id = 1
     for param_name, param_values in param_variations.items():
+        run_ids_of_each_param[param_name] = [0]
         current_value = getattr(base_params, param_name)
         for value in param_values:
             if value == current_value:
@@ -334,15 +391,17 @@ def run_ablation_study(base_params: BenchmarkParams,
             print(f"Running benchmark with {param_name} = {value}...")
             modified_params = base_params.create_variation(param_name, value)
             result = run_benchmark(modified_params, run_dir, run_id)
+            run_ids_of_each_param[param_name].append(run_id)
+            save_single_result(result, results_file)
             run_id += 1
             results.append(result)
 
-    return results
+    return results, run_ids_of_each_param
 
 
 def run_grid_search(base_params: BenchmarkParams, param_grid: Dict[str,
                                                                    List[Any]],
-                    run_dir: str) -> List[Dict[str, Any]]:
+                    run_dir: str, results_file: str) -> List[Dict[str, Any]]:
     """Run a grid search over parameter combinations."""
     results = []
 
@@ -358,94 +417,45 @@ def run_grid_search(base_params: BenchmarkParams, param_grid: Dict[str,
 
         modified_params = BenchmarkParams.from_dict(params_dict)
         result = run_benchmark(modified_params, run_dir, run_id)
+        save_single_result(result, results_file)
         run_id += 1
         results.append(result)
 
     return results
 
 
-def save_results(results: List[Dict[str, Any]], filename: str) -> pd.DataFrame:
-    """Save results to a CSV file."""
-    rows = []
-    for i, result in enumerate(results):
-        # Start with run ID and elapsed time
-        row = {'run_id': i, 'elapsed_time': result['elapsed_time']}
+def save_single_result(result: Dict[str, Any], results_file: str) -> None:
+    """Save a single benchmark result to CSV file, creating or appending as needed."""
+    # Create row from the result
+    row = {'run_id': result['run_id'], 'elapsed_time': result['elapsed_time']}
 
-        # Add all metrics
-        for metric_name, metric_value in result['metrics'].items():
-            row[metric_name] = metric_value
+    # Add all metrics
+    for metric_name, metric_value in result['metrics'].items():
+        row[metric_name] = metric_value
 
-        # Add all parameters
-        for key, value in result['params'].items():
-            if isinstance(value, list):
-                row[key] = str(value)
-            else:
-                row[key] = value
+    # Add all parameters
+    for key, value in result['params'].items():
+        if isinstance(value, list):
+            row[key] = str(value)
+        else:
+            row[key] = value
 
-        rows.append(row)
+    # Add timeout status
+    row['timed_out'] = result.get('timed_out', False)
 
-    df = pd.DataFrame(rows)
-    df.to_csv(filename, index=False)
-    print(f"Results saved to {filename}")
-    return df
+    # Create DataFrame with single row
+    df = pd.DataFrame([row])
 
+    # Check if file exists to determine if we need to write headers
+    file_exists = os.path.isfile(results_file)
 
-def plot_results(df: pd.DataFrame,
-                 x_param: str,
-                 y_param: str = 'total_output_throughput',
-                 output_file: Optional[str] = None) -> None:
-    """
-    Create a plot showing the effect of a parameter on a performance metric.
-
-    Args:
-        df: DataFrame with results
-        x_param: Parameter to plot on x-axis
-        y_param: Metric to plot on y-axis (default: total_output_throughput)
-        output_file: Optional file to save plot to
-    """
-    plt.figure(figsize=(12, 6))
-
-    if isinstance(df[x_param].iloc[0], list) or df[x_param].dtype == 'object':
-        # For parameters like cuda_graph_batch_sizes that are lists
-        # We need a simpler representation for the x-axis
-        df['param_repr'] = df[x_param].apply(lambda x: str(x)[:10] + '...'
-                                             if len(str(x)) > 10 else str(x))
-        # Create the bar plot
-        ax = sns.barplot(x='param_repr', y=y_param, data=df)
-
-        # Add value annotations to each bar
-        for i, p in enumerate(ax.patches):
-            value = p.get_height()
-            ax.annotate(f'{value:.1f}', (p.get_x() + p.get_width() / 2., value),
-                        ha='center',
-                        va='bottom',
-                        fontsize=9)
-
-        plt.xticks(rotation=45)
+    # Write to CSV (append if file exists)
+    if file_exists:
+        df.to_csv(results_file, mode='a', header=False, index=False)
     else:
-        # For numeric parameters
-        ax = sns.lineplot(x=x_param, y=y_param, data=df, marker='o')
+        df.to_csv(results_file, index=False)
 
-        # Add value annotations to each point
-        for x, y in zip(df[x_param], df[y_param]):
-            ax.annotate(
-                f'{y:.1f}',
-                (x, y),
-                xytext=(0, 10),  # 10 points vertical offset
-                textcoords='offset points',
-                ha='center',
-                va='bottom',
-                fontsize=9)
-
-    metric_name = y_param.replace('_', ' ').title()
-    plt.title(f'Effect of {x_param} on {metric_name}')
-    plt.ylabel(metric_name)
-    plt.tight_layout()
-
-    if output_file:
-        plt.savefig(output_file)
-    else:
-        plt.show()
+    print(f"Result for run_id {result['run_id']} saved to {results_file}")
 
 
 def validate_study_params(parser, study_params_str):
@@ -466,6 +476,130 @@ def validate_study_params(parser, study_params_str):
     return study_params_str
 
 
+def plot_benchmark_results(results_file: str, plots_dir: str,
+                           param_variations: Dict[str, List[Any]],
+                           run_ids_of_each_param: Dict[str, List[int]]) -> None:
+    """
+    Create plots for benchmark results saved in a CSV file.
+
+    Args:
+        results_file: Path to the CSV file with benchmark results
+        plots_dir: Directory to save the plots
+        param_variations: Dictionary of parameter names and their possible values
+    """
+    print(f"Generating plots from results in {results_file}")
+
+    # Ensure plots directory exists
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Key metrics to plot
+    key_metrics = ['per_gpu_throughput', 'per_user_throughput', 'elapsed_time']
+
+    try:
+        # Create plots for each parameter that has multiple values in the dataset
+        for param in param_variations.keys():
+            # Load results from CSV file
+            df = pd.read_csv(results_file)
+            if len(df) <= 1:
+                print(
+                    "Not enough data points for plotting. Skipping plot generation."
+                )
+                return
+            # filter out the rows where the run_id is not in the run_ids_of_each_param[param]
+            df = df[df['run_id'].isin(run_ids_of_each_param[param])]
+            if param not in df.columns:
+                print(
+                    f"Parameter '{param}' not found in results file. Skipping.")
+                continue
+
+            # Convert parameter column to appropriate type if needed
+            # This handles cases where True/False might be stored as strings
+            if df[param].dtype == object:
+                try:
+                    if all(
+                            str(val).lower() in ['true', 'false']
+                            for val in df[param].unique() if pd.notna(val)):
+                        df[param] = df[param].apply(lambda x: str(x).lower(
+                        ) == 'true' if pd.notna(x) else x)
+                except:
+                    pass  # Keep as object if conversion fails
+
+            # Check if we have multiple values for this parameter
+            unique_values = df[param].dropna().unique()
+            if len(unique_values) <= 1:
+                print(f"Parameter '{param}' has only one value. Skipping plot.")
+                continue
+
+            # Filter rows where this parameter is not null
+            plot_df = df[~df[param].isna()]
+
+            if len(plot_df) > 1:
+                print(f"Creating plots for parameter: {param}")
+                for metric in key_metrics:
+                    if metric not in plot_df.columns:
+                        print(
+                            f"Metric '{metric}' not found in results. Skipping."
+                        )
+                        continue
+
+                    # Skip if all values for this metric are null
+                    if plot_df[metric].isna().all():
+                        print(
+                            f"All values for metric '{metric}' are null. Skipping."
+                        )
+                        continue
+
+                    plot_file = os.path.join(plots_dir,
+                                             f'{param}_vs_{metric}.png')
+
+                    plt.figure(figsize=(12, 6))
+
+                    # Use different plot types depending on parameter data type
+                    if plot_df[param].dtype == bool or plot_df[
+                            param].dtype == object:
+                        # For categorical parameters, use bar plot
+                        ax = sns.barplot(x=param, y=metric, data=plot_df)
+                        plt.xticks(rotation=45)
+                    else:
+                        # For numeric parameters, use line plot
+                        # Sort by parameter value to ensure line connects points in order
+                        plot_df = plot_df.sort_values(by=param)
+                        ax = sns.lineplot(x=param,
+                                          y=metric,
+                                          data=plot_df,
+                                          marker='o')
+
+                    # Add value annotations to data points
+                    for i, (x_val, y_val) in enumerate(
+                            zip(plot_df[param], plot_df[metric])):
+                        if pd.notna(y_val):  # Only annotate non-NaN values
+                            ax.annotate(
+                                f'{y_val:.1f}',
+                                (i if plot_df[param].dtype == bool
+                                 or plot_df[param].dtype == object else x_val,
+                                 y_val),
+                                xytext=(0, 10),  # 10 points vertical offset
+                                textcoords='offset points',
+                                ha='center',
+                                va='bottom',
+                                fontsize=9)
+
+                    # Set chart labels and title
+                    metric_title = metric.replace("_", " ").title()
+                    param_title = param.replace("_", " ").title()
+                    plt.title(f'Effect of {param_title} on {metric_title}')
+                    plt.ylabel(metric_title)
+                    plt.tight_layout()
+
+                    # Save the plot
+                    plt.savefig(plot_file)
+                    plt.close()  # Close the figure to free memory
+                    print(f"Saved plot to {plot_file}")
+
+    except Exception as e:
+        print(f"Error generating plots: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Run ablation study on TRT-LLM benchmarking parameters')
@@ -482,7 +616,6 @@ def main():
     parser.add_argument('--no-plots',
                         action='store_true',
                         help='Skip generating plots')
-
     # Ablation study parameters
     parser.add_argument(
         '--study-params',
@@ -611,14 +744,16 @@ def main():
 
     # Run the study based on the selected mode
     if args.mode == 'baseline':
-        results = run_baseline(base_params, run_dir)
+        results = run_baseline(base_params, run_dir, results_file)
     elif args.mode == 'ablation':
-        results = run_ablation_study(base_params, param_variations, run_dir)
+        results, run_ids_of_each_param = run_ablation_study(
+            base_params, param_variations, run_dir, results_file)
+        # Create plots from the results file
+        plot_benchmark_results(results_file, plots_dir, param_variations,
+                               run_ids_of_each_param)
     else:  # grid search
-        results = run_grid_search(base_params, param_grid, run_dir)
-
-    # Save results
-    df = save_results(results, results_file)
+        results = run_grid_search(base_params, param_grid, run_dir,
+                                  results_file)
 
     # Create symlink to latest run
     latest_link = os.path.join(args.output_dir, 'latest')
@@ -635,30 +770,6 @@ def main():
         # Symlinks might not be supported on some systems
         print(
             f"Could not create symlink to latest run. Latest run is: {run_dir}")
-
-    # Skip plotting for baseline mode or if no-plots is specified
-    if args.mode == 'baseline' or args.no_plots:
-        print("Skipping plots generation")
-        return
-
-    # Create plots for each parameter
-    # Key metrics to plot
-    key_metrics = ['per_gpu_throughput', 'per_user_throughput', 'elapsed_time']
-
-    for param in param_variations.keys():
-        param_results = [r for r in results if param in r['params']]
-        if len(param_results
-               ) > 1:  # Only plot if we have multiple values for this param
-            plot_df = df[~df[param].isna()]
-            if len(plot_df) > 1:
-                for metric in key_metrics:
-                    if metric in df.columns:
-                        plot_file = os.path.join(plots_dir,
-                                                 f'{param}_vs_{metric}.png')
-                        plot_results(plot_df,
-                                     x_param=param,
-                                     y_param=metric,
-                                     output_file=plot_file)
 
 
 if __name__ == '__main__':
