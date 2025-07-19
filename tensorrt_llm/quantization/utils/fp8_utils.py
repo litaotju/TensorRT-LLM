@@ -24,7 +24,9 @@ def align(x: int, y: int) -> int:
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+    x = torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+    y = x.view(torch.int)
+    return y
 
 
 @nvtx_range("[DG] quantization")
